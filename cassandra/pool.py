@@ -575,7 +575,7 @@ class HostConnection(object):
                     del self._connections[connection.shard_id]
                 if self.host.sharding_info:
                     self._connecting.add(connection.shard_id)
-                    self._open_connection_to_missing_shard(connection.shard_id)
+                    self._session.submit(self._open_connection_to_missing_shard, connection.shard_id)
                 else:
                     connection = self._session.cluster.connection_factory(self.host.endpoint)
                     if self._keyspace:
@@ -771,37 +771,35 @@ class HostConnection(object):
         connections have been set, `callback` will be called with two
         arguments: this pool, and a list of any errors that occurred.
         """
-        with self._lock:
-            remaining_callbacks = set(self._connections.values())
-            remaining_callbacks_lock = Lock()
-            errors = []
+        remaining_callbacks = set(self._connections.values())
+        remaining_callbacks_lock = Lock()
+        errors = []
+
+        if not remaining_callbacks:
+            callback(self, errors)
+            return
+
+        def connection_finished_setting_keyspace(conn, error):
+            self.return_connection(conn)
+            with remaining_callbacks_lock:
+                remaining_callbacks.remove(conn)
+            if error:
+                errors.append(error)
 
             if not remaining_callbacks:
                 callback(self, errors)
-                return
 
-            def connection_finished_setting_keyspace(conn, error):
-                self.return_connection(conn)
-                with remaining_callbacks_lock:
-                    remaining_callbacks.remove(conn)
-                if error:
-                    errors.append(error)
-
-                if not remaining_callbacks:
-                    callback(self, errors)
-
-            self._keyspace = keyspace
-            for conn in self._connections.values():
-                conn.set_keyspace_async(keyspace, connection_finished_setting_keyspace)
+        self._keyspace = keyspace
+        for conn in list(self._connections.values()):
+            conn.set_keyspace_async(keyspace, connection_finished_setting_keyspace)
 
     def get_connections(self):
         connections = self._connections
         return list(connections.values()) if connections else []
 
     def get_state(self):
-        with self._lock:
-            in_flights = [c.in_flight for c in self._connections.values()]
-            return {'shutdown': self.is_shutdown, 'open_count': self.open_count, 'in_flights': in_flights}
+        in_flights = [c.in_flight for c in list(self._connections.values())]
+        return {'shutdown': self.is_shutdown, 'open_count': self.open_count, 'in_flights': in_flights}
 
     @property
     def num_missing_or_needing_replacement(self):
@@ -810,8 +808,7 @@ class HostConnection(object):
 
     @property
     def open_count(self):
-        with self._lock:
-            return sum([1 if c and not (c.is_closed or c.is_defunct) else 0 for c in self._connections.values()])
+        return sum([1 if c and not (c.is_closed or c.is_defunct) else 0 for c in list(self._connections.values())])
 
     @property
     def _excess_connection_limit(self):
