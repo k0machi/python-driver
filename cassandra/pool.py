@@ -605,10 +605,10 @@ class HostConnection(object):
                 future.cancel()
 
             if self._connections:
-                for c in self._connections.values():
-                    log.debug("Closing connection (%s) to %s", id(c), self.host)
-                    c.close()
-                self._connections = {}
+                for connection in self._connections.values():
+                    log.debug("Closing connection (%s) to %s", id(connection), self.host)
+                    connection.close()
+                self._connections.clear()
 
         self._close_excess_connections()
 
@@ -795,8 +795,8 @@ class HostConnection(object):
                 conn.set_keyspace_async(keyspace, connection_finished_setting_keyspace)
 
     def get_connections(self):
-        c = self._connections
-        return list(self._connections.values()) if c else []
+        connections = self._connections
+        return list(connections.values()) if connections else []
 
     def get_state(self):
         with self._lock:
