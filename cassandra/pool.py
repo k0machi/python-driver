@@ -15,7 +15,7 @@
 """
 Connection pooling and host management.
 """
-
+from concurrent.futures import Future
 from functools import total_ordering
 import logging
 import socket
@@ -759,7 +759,8 @@ class HostConnection(object):
         for shard_id in range(self.host.sharding_info.shards_count):
             self._connecting.add(shard_id)
             future = self._session.submit(self._open_connection_to_missing_shard, shard_id)
-            self._shard_connections_futures.append(future)
+            if isinstance(future, Future):
+                self._shard_connections_futures.append(future)
 
     def _set_keyspace_for_all_conns(self, keyspace, callback):
         """
