@@ -569,23 +569,26 @@ class HostConnection(object):
             if self.is_shutdown:
                 return
 
-        log.debug("Replacing connection (%s) to %s", id(connection), self.host)
-        try:
-            if connection.shard_id in self._connections.keys():
-                del self._connections[connection.shard_id]
-            if self.host.sharding_info:
-                self._connecting.add(connection.shard_id)
-                self._open_connection_to_missing_shard(connection.shard_id)
+            log.debug("Replacing connection (%s) to %s", id(connection), self.host)
+            try:
+                if connection.shard_id in self._connections.keys():
+                    del self._connections[connection.shard_id]
+                if self.host.sharding_info:
+                    self._connecting.add(connection.shard_id)
+                    self._open_connection_to_missing_shard(connection.shard_id)
+                else:
+                    connection = self._session.cluster.connection_factory(self.host.endpoint)
+                    if self._keyspace:
+                        connection.set_keyspace_blocking(self._keyspace)
+                    self._connections[connection.shard_id] = connection
+            except Exception:
+                log.warning("Failed reconnecting %s. Retrying." % (self.host.endpoint,))
+                self._session.submit(self._replace, connection)
             else:
                 connection = self._session.cluster.connection_factory(self.host.endpoint, owning_pool=self)
                 if self._keyspace:
                     connection.set_keyspace_blocking(self._keyspace)
                 self._connections[connection.shard_id] = connection
-        except Exception:
-            log.warning("Failed reconnecting %s. Retrying." % (self.host.endpoint,))
-            self._session.submit(self._replace, connection)
-        else:
-            with self._lock:
                 self._is_replacing = False
                 self._stream_available_condition.notify()
 
@@ -756,11 +759,11 @@ class HostConnection(object):
             if self.is_shutdown:
                 return
 
-        for shard_id in range(self.host.sharding_info.shards_count):
-            self._connecting.add(shard_id)
-            future = self._session.submit(self._open_connection_to_missing_shard, shard_id)
-            if isinstance(future, Future):
-                self._shard_connections_futures.append(future)
+            for shard_id in range(self.host.sharding_info.shards_count):
+                self._connecting.add(shard_id)
+                future = self._session.submit(self._open_connection_to_missing_shard, shard_id)
+                if isinstance(future, Future):
+                    self._shard_connections_futures.append(future)
 
     def _set_keyspace_for_all_conns(self, keyspace, callback):
         """
@@ -768,35 +771,37 @@ class HostConnection(object):
         connections have been set, `callback` will be called with two
         arguments: this pool, and a list of any errors that occurred.
         """
-        remaining_callbacks = set(self._connections.values())
-        remaining_callbacks_lock = Lock()
-        errors = []
-
-        if not remaining_callbacks:
-            callback(self, errors)
-            return
-
-        def connection_finished_setting_keyspace(conn, error):
-            self.return_connection(conn)
-            with remaining_callbacks_lock:
-                remaining_callbacks.remove(conn)
-            if error:
-                errors.append(error)
+        with self._lock:
+            remaining_callbacks = set(self._connections.values())
+            remaining_callbacks_lock = Lock()
+            errors = []
 
             if not remaining_callbacks:
                 callback(self, errors)
+                return
 
-        self._keyspace = keyspace
-        for conn in self._connections.values():
-            conn.set_keyspace_async(keyspace, connection_finished_setting_keyspace)
+            def connection_finished_setting_keyspace(conn, error):
+                self.return_connection(conn)
+                with remaining_callbacks_lock:
+                    remaining_callbacks.remove(conn)
+                if error:
+                    errors.append(error)
+
+                if not remaining_callbacks:
+                    callback(self, errors)
+
+            self._keyspace = keyspace
+            for conn in self._connections.values():
+                conn.set_keyspace_async(keyspace, connection_finished_setting_keyspace)
 
     def get_connections(self):
         c = self._connections
         return list(self._connections.values()) if c else []
 
     def get_state(self):
-        in_flights = [c.in_flight for c in self._connections.values()]
-        return {'shutdown': self.is_shutdown, 'open_count': self.open_count, 'in_flights': in_flights}
+        with self._lock:
+            in_flights = [c.in_flight for c in self._connections.values()]
+            return {'shutdown': self.is_shutdown, 'open_count': self.open_count, 'in_flights': in_flights}
 
     @property
     def num_missing_or_needing_replacement(self):
@@ -805,7 +810,8 @@ class HostConnection(object):
 
     @property
     def open_count(self):
-        return sum([1 if c and not (c.is_closed or c.is_defunct) else 0 for c in self._connections.values()])
+        with self._lock:
+            return sum([1 if c and not (c.is_closed or c.is_defunct) else 0 for c in self._connections.values()])
 
     @property
     def _excess_connection_limit(self):
